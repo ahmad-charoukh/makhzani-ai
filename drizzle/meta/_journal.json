@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1789929530337,
+      "tag": "0000_cute_kid_colt",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1789968029622,
+      "tag": "0001_talented_stick",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1789968569103,
+      "tag": "0002_purchase_transition_guards",
+      "breakpoints": true
+    }
+  ]
+}

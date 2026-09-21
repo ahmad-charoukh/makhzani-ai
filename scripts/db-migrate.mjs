@@ -1,0 +1,10 @@
+import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+const build=JSON.parse(readFileSync('dist/server/wrangler.json','utf8'));
+mkdirSync('.sites-runtime',{recursive:true});
+const config={name:'makhzani-local-migrations',compatibility_date:build.compatibility_date,d1_databases:build.d1_databases.map(d=>({...d,migrations_dir:resolve('drizzle')}))};
+writeFileSync('.sites-runtime/migrations.json',JSON.stringify(config));
+const state=process.env.MAKHZANI_LOCAL_DB_STATE||'.wrangler/state';
+const r=spawnSync(process.execPath,['--import','./scripts/sites-env.mjs','./node_modules/wrangler/bin/wrangler.js','d1','migrations','apply','DB','--local','--config','.sites-runtime/migrations.json','--persist-to',state],{stdio:'inherit'});
+process.exit(r.status??1);
