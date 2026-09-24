@@ -21,6 +21,24 @@ export type Product = {
   reorder: { daily: number; days: number | null; suggested: number };
 };
 export type Warehouse = { id: string; name: string; branch: string };
+export type InventoryFilters = {
+  category: string;
+  stock: "all" | "available" | "low" | "empty";
+  warehouse: string;
+  sort:
+    | "name-asc"
+    | "name-desc"
+    | "quantity-asc"
+    | "quantity-desc"
+    | "price-asc"
+    | "price-desc";
+};
+export const inventoryDefaults: InventoryFilters = {
+  category: "",
+  stock: "all",
+  warehouse: "",
+  sort: "name-asc",
+};
 export type Movement = {
   id: string;
   name: string;
@@ -61,6 +79,9 @@ export type Snapshot = {
   email: string;
   page: number;
   hasMore: boolean;
+  categories?: string[];
+  totalProducts?: number;
+  pageCount?: number;
 };
 export const kindLabels: Record<string, string> = {
   in: "إدخال بضاعة",
@@ -99,6 +120,7 @@ export type ApiResult = {
   draft?: { productId: string; quantity: number; kind: string };
 };
 export type ReadResult = Snapshot & {
+  product?: Product;
   items: Record<string, string | number>[];
   lines: Record<string, string | number>[];
   prices: Record<string, string | number>[];
@@ -106,19 +128,60 @@ export type ReadResult = Snapshot & {
   images: { id: string }[];
   error?: string;
 };
+export class ApiRequestError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+  }
+}
+export async function readApiResponse<T>(
+  r: Response,
+  fallback: string,
+): Promise<T> {
+  let result: Record<string, unknown> | null = null;
+  try {
+    const body: unknown = await r.json();
+    if (body && typeof body === "object" && !Array.isArray(body))
+      result = body as Record<string, unknown>;
+  } catch {
+    // A proxy or expired session can return HTML instead of API JSON.
+  }
+  if (!r.ok) {
+    const message =
+      typeof result?.error === "string" && result.error.trim()
+        ? result.error
+        : r.status === 401
+          ? "انتهت الجلسة. سجّل الدخول مرة أخرى."
+          : r.status === 429
+            ? "طلبات كثيرة. انتظر قليلًا وحاول مجددًا."
+            : fallback;
+    throw new ApiRequestError(message, r.status);
+  }
+  if (!result) throw new ApiRequestError(fallback + ". حاول مجددًا.", r.status);
+  return result as T;
+}
+async function request(url: string, options?: RequestInit) {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    throw new ApiRequestError(
+      "تعذر الاتصال. تحقق من الإنترنت وحاول مجددًا.",
+      0,
+    );
+  }
+}
 export async function api(data: unknown) {
-  const r = await fetch("/api/inventory", {
+  const r = await request("/api/inventory", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  const result = (await r.json()) as ApiResult;
-  if (!r.ok) throw Error(result.error || "تعذرت العملية");
-  return result;
+  return readApiResponse<ApiResult>(r, "تعذرت العملية");
 }
-export async function get(view: string) {
-  const r = await fetch("/api/inventory?view=" + view);
-  const data = (await r.json()) as ReadResult;
-  if (!r.ok) throw Error(data.error || "تعذر التحميل");
-  return data;
+export async function get(view: string, signal?: AbortSignal) {
+  const r = await request("/api/inventory?view=" + view, { signal });
+  return readApiResponse<ReadResult>(r, "تعذر التحميل");
 }

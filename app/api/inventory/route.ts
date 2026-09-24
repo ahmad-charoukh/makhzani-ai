@@ -96,6 +96,12 @@ export async function GET(request: Request) {
         c,
         (url.searchParams.get("q") || "").slice(0, 100),
         Math.min(10000, Math.max(1, Number(url.searchParams.get("page")) || 1)),
+        {
+          category: (url.searchParams.get("category") || "").slice(0, 100),
+          stock: url.searchParams.get("stock") || "all",
+          warehouse: (url.searchParams.get("warehouse") || "").slice(0, 100),
+          sort: url.searchParams.get("sort") || "name-asc",
+        },
       ),
       { headers: { "Cache-Control": "private, no-store" } },
     );

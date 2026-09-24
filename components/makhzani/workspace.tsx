@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Package,
   LayoutDashboard,
@@ -31,11 +31,15 @@ import {
   Send,
   WifiOff,
   CheckCircle2,
-  FileText,
+  PanelRightClose,
+  X,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import {
   api,
+  readApiResponse,
+  inventoryDefaults,
+  type InventoryFilters,
   get,
   number,
   kindLabels,
@@ -43,24 +47,50 @@ import {
   type Snapshot,
 } from "./types";
 import { Empty, ErrorBox, Field, Modal, ProductIcon } from "./primitives";
-const ProductForm=dynamic(()=>import("./product-form"),{ssr:false});
-const StockForm=dynamic(()=>import("./stock-form"),{ssr:false});
-const Management=dynamic(()=>import("./management"),{ssr:false});
-const ProductDetails=dynamic(()=>import("./product-details"),{ssr:false});
-const Scanner=dynamic(()=>import("./scanner"),{ssr:false});
-const StockChart=dynamic(()=>import("./stock-chart"),{ssr:false});
+import { Inventory } from "./inventory";
+import SettingsPanel from "./settings-panel";
+const deferredLoading = () => (
+  <div className="component-loading" role="status">
+    <span className="loading-bar" />
+    جارٍ التحميل…
+  </div>
+);
+const ProductForm = dynamic(() => import("./product-form"), {
+  ssr: false,
+  loading: deferredLoading,
+});
+const StockForm = dynamic(() => import("./stock-form"), {
+  ssr: false,
+  loading: deferredLoading,
+});
+const Management = dynamic(() => import("./management"), {
+  ssr: false,
+  loading: deferredLoading,
+});
+const ProductDetails = dynamic(() => import("./product-details"), {
+  ssr: false,
+  loading: deferredLoading,
+});
+const Scanner = dynamic(() => import("./scanner"), {
+  ssr: false,
+  loading: deferredLoading,
+});
+const StockChart = dynamic(() => import("./stock-chart"), {
+  ssr: false,
+  loading: deferredLoading,
+});
 const navigation = [
   ["dashboard", "نظرة عامة", LayoutDashboard],
   ["inventory", "المخزون", Boxes],
   ["movements", "حركة البضاعة", ArrowLeftRight],
-  ["low", "شو ناقص؟", TriangleAlert],
-  ["purchases", "طلبات البضاعة", ShoppingBag],
+  ["low", "تنبيهات المخزون", TriangleAlert],
+  ["purchases", "طلبات الشراء", ShoppingBag],
   ["suppliers", "الموردون", Truck],
   ["reports", "التقارير", ChartNoAxesCombined],
   ["warehouses", "المخازن والفروع", Warehouse],
   ["members", "فريق العمل", Users],
   ["audit", "سجل العمليات", History],
-  ["settings", "الإعدادات", Settings],
+  ["settings", "التفضيلات والمسودات", Settings],
 ] as const;
 type Message = {
   text: string;
@@ -71,6 +101,13 @@ export default function Workspace() {
   const [data, setData] = useState<Snapshot | null>(null);
   const [view, setView] = useState("dashboard");
   const [q, setQ] = useState("");
+  const [filters, setFilters] = useState<InventoryFilters>(inventoryDefaults);
+  const [collapsed, setCollapsed] = useState(false);
+  const [desktop, setDesktop] = useState(false);
+  const [settingUp, setSettingUp] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const requestRef = useRef<AbortController | null>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
   const [page, setPage] = useState(1);
   const [error, setError] = useState("");
   const [auth, setAuth] = useState(0);
@@ -91,44 +128,122 @@ export default function Workspace() {
   >();
   const [locale, setLocale] = useState("ar");
   const load = useCallback(async () => {
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
     setLoading(true);
     try {
-      const r = await fetch(
-        "/api/inventory?q=" + encodeURIComponent(q) + "&page=" + page,
-      );
-      const d = (await r.json()) as Snapshot & { error?: string };
+      const params = new URLSearchParams({ q, page: String(page), ...filters });
+      const r = await fetch("/api/inventory?" + params, {
+        signal: controller.signal,
+        cache: "no-store",
+      });
       if (!r.ok) {
         setAuth(r.status);
         if (r.status === 401 || r.status === 403) {
           setData(null);
-          sessionStorage.removeItem("mk-cache");
+          try {
+            sessionStorage.removeItem("mk-cache");
+          } catch {
+            /* Storage can be disabled. */
+          }
         }
-        throw Error(d.error);
       }
+      const d = await readApiResponse<Snapshot>(
+        r,
+        "تعذر تحميل المخزون. حاول مرة أخرى.",
+      );
+      if (controller.signal.aborted) return;
       setAuth(0);
       setData(d);
       setError("");
-      sessionStorage.setItem("mk-cache", JSON.stringify(d));
+      try {
+        sessionStorage.setItem("mk-cache", JSON.stringify(d));
+      } catch {
+        /* Reading stock does not require browser storage. */
+      }
     } catch (e) {
-      setError((e as Error).message);
+      if (controller.signal.aborted) return;
+      setError(
+        e instanceof TypeError
+          ? "تعذر الاتصال. تحقق من الإنترنت وحاول مرة أخرى."
+          : (e as Error).message,
+      );
       if (!navigator.onLine) {
-        const cached = sessionStorage.getItem("mk-cache");
-        if (cached) setData(JSON.parse(cached));
+        try {
+          const cached = sessionStorage.getItem("mk-cache");
+          if (cached) setData(JSON.parse(cached));
+        } catch {
+          /* An unavailable or corrupt cache must not block retry. */
+        }
       }
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
-  }, [q, page]);
+  }, [q, page, filters]);
   useEffect(() => {
     const t = setTimeout(() => void load(), 250);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(t);
+      requestRef.current?.abort();
+    };
   }, [load]);
   useEffect(() => {
+    const media = window.matchMedia("(min-width: 901px)");
+    const update = () => {
+      setDesktop(media.matches);
+      if (media.matches) setMenu(false);
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    if (!menu || desktop) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusable = () =>
+      Array.from(
+        sidebarRef.current?.querySelectorAll<HTMLElement>(
+          "a[href], button:not([disabled])",
+        ) || [],
+      );
+    focusable()[0]?.focus();
+    const keydown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setMenu(false);
+      }
+      if (e.key === "Tab") {
+        const nodes = focusable();
+        const first = nodes[0];
+        const last = nodes.at(-1);
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last?.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => {
+      document.body.style.overflow = overflow;
+      document.removeEventListener("keydown", keydown);
+      previous?.focus();
+    };
+  }, [menu, desktop]);
+  useEffect(() => {
     const on = () => setOffline(!navigator.onLine);
+    on();
     window.addEventListener("online", on);
     window.addEventListener("offline", on);
     if ("serviceWorker" in navigator)
-      void navigator.serviceWorker.register("/sw.js");
+      void navigator.serviceWorker.register("/sw.js").catch(() => {
+        /* The app remains usable when offline support is unavailable. */
+      });
     return () => {
       window.removeEventListener("online", on);
       window.removeEventListener("offline", on);
@@ -144,6 +259,7 @@ export default function Workspace() {
     setMenu(false);
     setPage(1);
     setQ("");
+    setFilters(inventoryDefaults);
   };
   const saved = () => {
     setModal(null);
@@ -198,9 +314,36 @@ export default function Workspace() {
     s.onerror = () => setToast("تعذر التقاط الصوت");
     s.start();
   }
-  function exportCSV() {
-    const link=document.createElement('a');link.href='/api/export';link.download='makhzani-stock.csv';link.click();
+  async function exportCSV() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const response = await fetch("/api/export");
+      if (!response.ok)
+        await readApiResponse(response, "تعذر تصدير المخزون. حاول مرة أخرى.");
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "makhzani-stock.csv";
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setToast("تم تجهيز ملف المخزون");
+    } catch {
+      setError("تعذر تصدير المخزون. تحقق من الاتصال وحاول مرة أخرى.");
+    } finally {
+      setExporting(false);
+    }
   }
+  const openSearch = () => {
+    nav("inventory");
+    setTimeout(
+      () =>
+        document
+          .querySelector<HTMLInputElement>(".inventory-toolbar input")
+          ?.focus(),
+      0,
+    );
+  };
 
   const tr = (ar: string, en: string, tr: string) =>
     locale === "ar" ? ar : locale === "tr" ? tr : en;
@@ -222,7 +365,10 @@ export default function Workspace() {
           </h1>
           <p>أدخل البضاعة، تابع الكميات، واعرف شو ناقص — من مكان واحد.</p>
           {loading ? (
-            <div className="loading-bar" />
+            <div className="component-loading" role="status">
+              <div className="loading-bar" />
+              جارٍ تحميل مساحة عملك…
+            </div>
           ) : auth === 401 ? (
             <a
               className="primary"
@@ -236,19 +382,27 @@ export default function Workspace() {
               className="form-stack"
               onSubmit={async (e) => {
                 e.preventDefault();
+                if (settingUp) return;
                 const f = new FormData(e.currentTarget);
+                setSettingUp(true);
+                setError("");
                 try {
                   await api({ type: "setup", name: f.get("name") });
                   void load();
                 } catch (e) {
                   setError((e as Error).message);
+                } finally {
+                  setSettingUp(false);
                 }
               }}
             >
               <Field label="اسم المحل أو النشاط">
                 <input name="name" placeholder="مثال: متجر البركة" required />
               </Field>
-              <button className="primary">إنشاء مخزني</button>
+              <ErrorBox error={error} />
+              <button disabled={settingUp} className="primary">
+                {settingUp ? "جارٍ إنشاء مساحة العمل…" : "إنشاء مخزني"}
+              </button>
               <small>
                 إذا كنت موظفًا، اطلب من المالك إضافة بريد حسابك ثم حدّث الصفحة.
               </small>
@@ -288,18 +442,39 @@ export default function Workspace() {
     .filter(
       ([key]) =>
         !isEmployee ||
-        ["dashboard", "inventory", "movements", "low"].includes(key),
+        ["dashboard", "inventory", "movements", "low", "settings"].includes(
+          key,
+        ),
     )
-    .filter(
-      ([key]) =>
-        data.role === "owner" || !["members", "settings"].includes(key),
-    );
+    .filter(([key]) => data.role === "owner" || key !== "members");
   return (
-    <div className="app-shell" dir={locale === "ar" ? "rtl" : "ltr"}>
-      <aside className={"sidebar " + (menu ? "open" : "")}>
+    <div
+      className={"app-shell" + (collapsed ? " sidebar-collapsed" : "")}
+      dir="rtl"
+    >
+      <a className="skip-link" href="#main-content">
+        تجاوز إلى المحتوى
+      </a>
+      <aside
+        id="workspace-navigation"
+        ref={sidebarRef}
+        className={"sidebar " + (menu ? "open" : "")}
+        inert={!desktop && !menu}
+        role={!desktop && menu ? "dialog" : undefined}
+        aria-modal={!desktop && menu ? true : undefined}
+        aria-label="التنقل في مساحة العمل"
+      >
+        <button
+          className="drawer-close icon-button"
+          aria-label="إغلاق القائمة"
+          onClick={() => setMenu(false)}
+        >
+          <X size={20} />
+        </button>
         <a
           href="#"
           className="brand"
+          aria-label="مخزني — نظرة عامة"
           onClick={(e) => {
             e.preventDefault();
             nav("dashboard");
@@ -321,23 +496,29 @@ export default function Workspace() {
           <ChevronLeft size={16} />
         </div>
         <small className="nav-label">إدارة مخزونك</small>
-        <nav>
+        <nav aria-label="القائمة الرئيسية">
           {visibleNav.map(([key, label, Icon]) => (
             <button
               key={key}
               className={view === key ? "active" : ""}
+              aria-current={view === key ? "page" : undefined}
+              title={collapsed ? label : undefined}
               onClick={() => nav(key)}
             >
               <Icon size={20} />
               <span>{label}</span>
-              {key === "low" && data.low.length > 0 && (
-                <em>{data.low.length}</em>
+              {key === "low" && data.stats.low + data.stats.empty > 0 && (
+                <em>{number(data.stats.low + data.stats.empty)}</em>
               )}
             </button>
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <button className="ai-shortcut" onClick={() => setModal("assistant")}>
+          <button
+            className="ai-shortcut"
+            aria-label="مساعد مخزني"
+            onClick={() => setModal("assistant")}
+          >
             <Sparkles size={20} />
             <span>
               مساعد مخزني<small>اسأل. افهم. قرر.</small>
@@ -376,20 +557,34 @@ export default function Workspace() {
           onClick={() => setMenu(false)}
         />
       )}
-      <div className="main-shell">
+      <div className="main-shell" inert={menu && !desktop}>
         <header className="topbar">
           <div className="breadcrumb">
             <button
               className="icon-button mobile-menu"
+              aria-expanded={menu}
+              aria-controls="workspace-navigation"
               aria-label="فتح القائمة"
               onClick={() => setMenu(!menu)}
             >
               <Menu />
             </button>
+            <button
+              className="icon-button desktop-collapse"
+              aria-label={collapsed ? "توسيع القائمة" : "طي القائمة"}
+              aria-expanded={!collapsed}
+              onClick={() => setCollapsed(!collapsed)}
+            >
+              <PanelRightClose size={19} />
+            </button>
             <span>مساحة العمل</span>
             <ChevronLeft size={14} />
             <b>{navigation.find((n) => n[0] === view)?.[1]}</b>
           </div>
+          <button className="topbar-search" onClick={openSearch}>
+            <Search size={17} />
+            <span>البحث في المخزون…</span>
+          </button>
           <div className="topbar-actions">
             <span className="today">
               {new Date().toLocaleDateString("ar", {
@@ -399,7 +594,7 @@ export default function Workspace() {
               })}
             </span>
             <select
-              aria-label="لغة التنقل"
+              aria-label="لغة الترحيب"
               value={locale}
               onChange={(e) => setLocale(e.target.value)}
             >
@@ -417,7 +612,7 @@ export default function Workspace() {
             </button>
           </div>
         </header>
-        <main className="content">
+        <main id="main-content" className="content" tabIndex={-1}>
           {offline && (
             <div className="info-box">
               <WifiOff size={19} />
@@ -425,28 +620,44 @@ export default function Workspace() {
               كمسودات.
             </div>
           )}
-          <ErrorBox error={error} />
+          {error && (
+            <div className="request-error">
+              <ErrorBox error={error} />
+              <button
+                className="secondary"
+                onClick={() => void load()}
+                disabled={loading}
+              >
+                إعادة المحاولة
+              </button>
+            </div>
+          )}
+          {exporting && (
+            <div role="status" className="info-box">
+              جارٍ تجهيز ملف المخزون…
+            </div>
+          )}
           {view === "dashboard" && (
             <>
               <div className="section-title">
                 <div>
                   <div className="eyebrow">
                     {tr(
-                      "كل شيء تحت السيطرة",
+                      "مساحة عملياتك اليومية",
                       "Everything in view",
                       "Her şey kontrol altında",
                     )}
                   </div>
                   <h1>
                     {tr(
-                      "أهلًا، يومك اليوم أسهل 👋",
-                      "Your day, made simpler 👋",
-                      "Bugün işler daha kolay 👋",
+                      "نظرة أوضح. قرارات أفضل.",
+                      "Clear stock. Better decisions.",
+                      "Net stok. Daha iyi kararlar.",
                     )}
                   </h1>
                   <p className="muted">
                     {tr(
-                      "هاي نظرة سريعة على مخزونك. شو بدنا نعمل اليوم؟",
+                      "تابع مخزونك وحركة البضاعة، وابدأ بالأهم اليوم.",
                       "A clear view of your stock. What’s next?",
                       "Stoğuna hızlı bir bakış. Bugün ne yapalım?",
                     )}
@@ -460,6 +671,111 @@ export default function Workspace() {
                   مسح باركود
                 </button>
               </div>
+              <section className="overview-hero" aria-label="أولويات المخزون">
+                <div className="hero-copy">
+                  <span className="hero-kicker">
+                    <span className="live-dot" />
+                    {data.business.name}
+                  </span>
+                  <h2>
+                    {data.stats.low + data.stats.empty > 0
+                      ? "كل تنبيه، خطوة للأمام."
+                      : "كل شيء في مكانه."}
+                  </h2>
+                  <p>
+                    {data.stats.low + data.stats.empty > 0
+                      ? "لديك " +
+                        number(data.stats.low + data.stats.empty) +
+                        " منتجًا يحتاج متابعة. راجع النواقص وجهّز التوريد قبل نفاد الكمية."
+                      : "ابدأ يومك بمتابعة الكميات، وسجّل كل حركة لتبقى أرقامك واضحة."}
+                  </p>
+                  <div className="button-row">
+                    <button
+                      className="hero-primary"
+                      onClick={() =>
+                        data.stats.low + data.stats.empty > 0
+                          ? nav("low")
+                          : nav("inventory")
+                      }
+                    >
+                      {data.stats.low + data.stats.empty > 0
+                        ? "مراجعة النواقص"
+                        : "استعراض المخزون"}
+                      <ChevronLeft size={17} />
+                    </button>
+                    {!isEmployee && (
+                      <button
+                        className="hero-secondary"
+                        onClick={() => {
+                          setSelected(undefined);
+                          setBarcode("");
+                          setModal("product");
+                        }}
+                      >
+                        <Plus size={17} />
+                        إضافة منتج
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="hero-health">
+                  <span>جاهزية المخزون</span>
+                  <strong>
+                    {data.stats.products
+                      ? number(
+                          Math.round(
+                            ((data.stats.products -
+                              data.stats.low -
+                              data.stats.empty) /
+                              data.stats.products) *
+                              100,
+                          ),
+                        ) + "٪"
+                      : "—"}
+                  </strong>
+                  <div
+                    className="stock-health-bar"
+                    role="img"
+                    aria-label={
+                      number(
+                        Math.max(
+                          0,
+                          data.stats.products -
+                            data.stats.low -
+                            data.stats.empty,
+                        ),
+                      ) +
+                      " منتج فوق حد التنبيه من " +
+                      number(data.stats.products)
+                    }
+                  >
+                    <i
+                      style={{
+                        flex: Math.max(
+                          0,
+                          data.stats.products -
+                            data.stats.low -
+                            data.stats.empty,
+                        ),
+                      }}
+                    />
+                    <i style={{ flex: data.stats.low }} />
+                    <i style={{ flex: data.stats.empty }} />
+                  </div>
+                  <small>
+                    {data.stats.products
+                      ? "المنتجات فوق حد التنبيه"
+                      : "أضف منتجاتك لتظهر جاهزية المخزون"}
+                  </small>
+                  <button
+                    onClick={() => nav("warehouses")}
+                    disabled={isEmployee}
+                  >
+                    <Warehouse size={15} />
+                    {number(data.warehouses.length)} مخازن وفروع
+                  </button>
+                </div>
+              </section>
               <div className="stats-grid">
                 {[
                   [
@@ -507,7 +823,10 @@ export default function Workspace() {
                 })}
               </div>
               <section className="quick-section">
-                <h2>شو بدنا نعمل؟</h2>
+                <div className="quick-heading">
+                  <h2>ابدأ عملية جديدة</h2>
+                  <span className="muted">خطوات قليلة، مخزون أدق</span>
+                </div>
                 <div className="quick-grid">
                   {[
                     [
@@ -583,13 +902,13 @@ export default function Workspace() {
                 <section className="panel chart-panel">
                   <div className="panel-heading">
                     <div>
-                      <h2>شو صار بالمخزن؟</h2>
+                      <h2>حركة المخزون</h2>
                       <p className="muted">حركة البضاعة خلال آخر 30 يوم</p>
                     </div>
                     <span className="badge neutral">آخر 30 يوم</span>
                   </div>
                   {data.daily.length ? (
-                    <StockChart daily={data.daily}/>
+                    <StockChart daily={data.daily} />
                   ) : (
                     <Empty text="ابدأ بأول حركة بضاعة">
                       <p>ستظهر حركة مخزونك هنا تلقائيًا.</p>
@@ -615,8 +934,10 @@ export default function Workspace() {
                 <section className="panel low-panel">
                   <div className="panel-heading">
                     <h2>
-                      شو ناقص اليوم؟{" "}
-                      <span className="count-badge">{data.low.length}</span>
+                      تحتاج انتباهك{" "}
+                      <span className="count-badge">
+                        {number(data.stats.low + data.stats.empty)}
+                      </span>
                     </h2>
                     <button className="text-button" onClick={() => nav("low")}>
                       عرض الكل <ChevronLeft size={14} />
@@ -687,187 +1008,28 @@ export default function Workspace() {
             </>
           )}
           {view === "inventory" && (
-            <>
-              <div className="section-title">
-                <div>
-                  <h1>المخزون</h1>
-                  <p className="muted">
-                    منتجاتك، صورها، وكمياتها — بنظرة واحدة.
-                  </p>
-                </div>
-                {!isEmployee && (
-                  <button
-                    className="primary"
-                    onClick={() => {
-                      setSelected(undefined);
-                      setBarcode("");
-                      setModal("product");
-                    }}
-                  >
-                    <Plus size={19} />
-                    إضافة منتج
-                  </button>
-                )}
-              </div>
-              <div className="panel">
-                <div className="inventory-toolbar">
-                  <div className="search-field">
-                    <Search size={19} />
-                    <input
-                      placeholder="ابحث بالاسم، الباركود، التصنيف…"
-                      value={q}
-                      onChange={(e) => {
-                        setPage(1);
-                        setQ(e.target.value);
-                      }}
-                    />
-                  </div>
-                  <button
-                    className="secondary"
-                    onClick={() => setModal("scanner")}
-                  >
-                    <ScanLine size={19} />
-                    مسح
-                  </button>
-                  {!isEmployee && (
-                    <button
-                      className="icon-button"
-                      title="تصدير المخزون"
-                      aria-label="تصدير المخزون CSV"
-                      onClick={exportCSV}
-                    >
-                      <Download size={20} />
-                    </button>
-                  )}
-                </div>
-                {data.products.length ? (
-                  <div className="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>المنتج</th>
-                          <th>التصنيف</th>
-                          <th>الكمية الحالية</th>
-                          <th>الحالة</th>
-                          <th>سعر البيع</th>
-                          <th>إجراء سريع</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {data.products.map((p) => (
-                          <tr key={p.id}>
-                            <td>
-                              <button
-                                className="product-cell"
-                                onClick={() => {
-                                  setSelected(p);
-                                  setModal("detail");
-                                }}
-                              >
-                                <ProductIcon p={p} />
-                                <span>
-                                  <b>{p.name}</b>
-                                  <small>{p.barcode}</small>
-                                </span>
-                              </button>
-                            </td>
-                            <td>
-                              <span className="category-tag">{p.category}</span>
-                            </td>
-                            <td>
-                              <b>{number(p.quantity / 1000)}</b>{" "}
-                              <small>{p.unit}</small>
-                            </td>
-                            <td>
-                              <span
-                                className={
-                                  "badge " +
-                                  (p.quantity === 0
-                                    ? "danger-badge"
-                                    : p.quantity <= p.minimum
-                                      ? "warning"
-                                      : "success")
-                                }
-                              >
-                                {p.quantity === 0
-                                  ? "نفد"
-                                  : p.quantity <= p.minimum
-                                    ? "منخفض"
-                                    : "متوفر"}
-                              </span>
-                            </td>
-                            <td>{number(p.selling_price / 100)} ₺</td>
-                            <td>
-                              <div className="button-row">
-                                <button
-                                  className="table-action"
-                                  title="إدخال"
-                                  aria-label={"إدخال " + p.name}
-                                  onClick={() => action("in", p)}
-                                >
-                                  <ArrowDownToLine size={18} />
-                                </button>
-                                <button
-                                  className="table-action"
-                                  title="إخراج"
-                                  aria-label={"إخراج " + p.name}
-                                  onClick={() => action("out", p)}
-                                >
-                                  <ArrowUpFromLine size={18} />
-                                </button>
-                                <button
-                                  className="table-action"
-                                  title="جرد"
-                                  aria-label={"جرد " + p.name}
-                                  onClick={() => action("count", p)}
-                                >
-                                  <ClipboardCheck size={18} />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <Empty
-                    text={q ? "لم نجد هذا المنتج" : "أضف أول منتج إلى مخزنك"}
-                  >
-                    {!isEmployee && (
-                      <button
-                        className="primary"
-                        onClick={() => setModal("product")}
-                      >
-                        إضافة منتج
-                      </button>
-                    )}
-                  </Empty>
-                )}
-                <div className="pagination">
-                  <span>
-                    الصفحة {number(page)} ·{" "}
-                    {loading
-                      ? "جارٍ التحديث…"
-                      : `${number(data.products.length)} منتج`}
-                  </span>
-                  <div className="button-row">
-                    <button
-                      disabled={page === 1}
-                      onClick={() => setPage((p) => p - 1)}
-                    >
-                      السابق
-                    </button>
-                    <button
-                      disabled={!data.hasMore}
-                      onClick={() => setPage((p) => p + 1)}
-                    >
-                      التالي
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </>
+            <Inventory
+              data={data}
+              q={q}
+              setQ={setQ}
+              page={page}
+              setPage={setPage}
+              loading={loading}
+              filters={filters}
+              setFilters={setFilters}
+              onAction={action}
+              onDetails={(p) => {
+                setSelected(p);
+                setModal("detail");
+              }}
+              onAdd={() => {
+                setSelected(undefined);
+                setBarcode("");
+                setModal("product");
+              }}
+              onScan={() => setModal("scanner")}
+              onExport={() => void exportCSV()}
+            />
           )}
           {view === "movements" && (
             <>
@@ -908,7 +1070,7 @@ export default function Workspace() {
             <>
               <div className="section-title">
                 <div>
-                  <h1>شو ناقص؟</h1>
+                  <h1>تنبيهات المخزون</h1>
                   <p className="muted">الأهم أولًا، بدون إزعاج.</p>
                 </div>
                 <button className="secondary" onClick={() => load()}>
@@ -916,6 +1078,15 @@ export default function Workspace() {
                   تحديث
                 </button>
               </div>
+              {data.low.length === 0 && (
+                <section className="panel">
+                  <Empty text="لا توجد نواقص حاليًا">
+                    <p>
+                      كل منتجاتك فوق حد التنبيه. راجع تنبيهات الصلاحية أدناه.
+                    </p>
+                  </Empty>
+                </section>
+              )}
               <div className="management-grid">
                 {data.low.map((p) => (
                   <div className="panel management-card" key={p.id}>
@@ -1066,7 +1237,11 @@ export default function Workspace() {
             <Management view={view} data={data} changed={() => void load()} />
           )}
           {view === "settings" && (
-            <SettingsPanel data={data} notify={setToast} />
+            <SettingsPanel
+              data={data}
+              notify={setToast}
+              changed={() => void load()}
+            />
           )}
         </main>
         <footer className="app-footer">
@@ -1077,7 +1252,11 @@ export default function Workspace() {
           </span>
         </footer>
       </div>
-      <nav className="bottom-nav">
+      <nav
+        className="bottom-nav"
+        aria-label="التنقل السريع"
+        inert={menu && !desktop}
+      >
         <button
           onClick={() => nav("dashboard")}
           className={view === "dashboard" ? "active" : ""}
@@ -1128,8 +1307,17 @@ export default function Workspace() {
             kind={modal}
             data={data}
             initial={draft}
+            initialWarehouseId={
+              view === "inventory" ? filters.warehouse : undefined
+            }
             saved={saved}
             unknown={(code) => {
+              if (isEmployee) {
+                setToast(
+                  "لم نجد هذا الباركود. اطلب من مدير المخزن إضافة المنتج.",
+                );
+                return;
+              }
               setBarcode(code);
               setSelected(undefined);
               setModal("product");
@@ -1159,6 +1347,11 @@ export default function Workspace() {
                 if (p) {
                   setSelected(p);
                   setModal("detail");
+                } else if (isEmployee) {
+                  setToast(
+                    "لم نجد هذا الباركود. اطلب من مدير المخزن إضافة المنتج.",
+                  );
+                  setModal(null);
                 } else {
                   setBarcode(code);
                   setSelected(undefined);
@@ -1181,7 +1374,12 @@ export default function Workspace() {
               </button>
             ))}
           </div>
-          <div className="chat-messages">
+          <div
+            className="chat-messages"
+            role="log"
+            aria-live="polite"
+            aria-label="محادثة مساعد مخزني"
+          >
             {messages.map((m, i) => (
               <div className={"chat-message " + (m.mine ? "mine" : "")} key={i}>
                 {!m.mine && <Sparkles size={16} />}
@@ -1220,8 +1418,13 @@ export default function Workspace() {
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="اسأل عن مخزونك…"
+              aria-label="سؤالك عن المخزون"
             />
-            <button disabled={thinking} className="primary" aria-label="إرسال">
+            <button
+              disabled={thinking || !question.trim()}
+              className="primary"
+              aria-label="إرسال"
+            >
               <Send size={18} />
             </button>
           </form>
@@ -1238,7 +1441,7 @@ function MovementTable({
   limit?: number;
 }) {
   return data.movements.length ? (
-    <div className="table-scroll">
+    <div className="table-scroll movement-table">
       <table>
         <thead>
           <tr>
@@ -1252,11 +1455,11 @@ function MovementTable({
         <tbody>
           {data.movements.slice(0, limit).map((m) => (
             <tr key={m.id}>
-              <td>
+              <td data-label="المنتج">
                 <b>{m.name}</b>
                 {m.reason && <small className="cell-note">{m.reason}</small>}
               </td>
-              <td>
+              <td data-label="الحركة">
                 <span
                   className={
                     "badge " + (m.delta >= 0 ? "success" : "blue-badge")
@@ -1265,12 +1468,16 @@ function MovementTable({
                   {kindLabels[m.kind]}
                 </span>
               </td>
-              <td className={m.delta >= 0 ? "positive" : "negative"} dir="ltr">
+              <td
+                data-label="الكمية"
+                className={m.delta >= 0 ? "positive" : "negative"}
+                dir="ltr"
+              >
                 {m.delta > 0 ? "+" : ""}
                 {number(m.delta / 1000)} {m.unit}
               </td>
-              <td>{m.warehouse}</td>
-              <td>
+              <td data-label="المخزن">{m.warehouse}</td>
+              <td data-label="الوقت">
                 <small>{m.created_at}</small>
               </td>
             </tr>
@@ -1280,93 +1487,5 @@ function MovementTable({
     </div>
   ) : (
     <Empty text="لا توجد حركات بعد" />
-  );
-}
-function SettingsPanel({
-  data,
-  notify,
-}: {
-  data: Snapshot;
-  notify: (s: string) => void;
-}) {
-  const [drafts, setDrafts] = useState<Record<string, unknown>[]>([]);
-  const [error, setError] = useState("");
-  function review() {
-    setDrafts(
-      JSON.parse(localStorage.getItem("mk-drafts") || "[]").filter(
-        (d: Record<string, unknown>) => d.email === data.email,
-      ),
-    );
-  }
-  return (
-    <>
-      <div className="section-title">
-        <h1>الإعدادات</h1>
-      </div>
-      <div className="management-grid">
-        <section className="panel">
-          <h2>المسودات دون اتصال</h2>
-          <p className="muted">
-            راجع كل مسودة عند عودة الاتصال. الجرد يتطلب بقاء الكمية المسجلة كما
-            كانت.
-          </p>
-          <button className="secondary" onClick={review}>
-            مراجعة المسودات
-          </button>
-          {drafts.map((d, i) => (
-            <div className="low-row" key={String(d.id)}>
-              <span>
-                {kindLabels[String(d.kind)]} · {String(d.quantity)}
-              </span>
-              <button
-                className="primary"
-                onClick={async () => {
-                  try {
-                    await api(d);
-                    const all = JSON.parse(
-                      localStorage.getItem("mk-drafts") || "[]",
-                    );
-                    localStorage.setItem(
-                      "mk-drafts",
-                      JSON.stringify(
-                        all.filter(
-                          (x: Record<string, unknown>) => x.id !== d.id,
-                        ),
-                      ),
-                    );
-                    setDrafts((ds) => ds.filter((_, j) => i !== j));
-                    notify("تمت مزامنة المسودة");
-                  } catch (e) {
-                    setError((e as Error).message);
-                  }
-                }}
-              >
-                تأكيد ومزامنة
-              </button>
-            </div>
-          ))}
-          <ErrorBox error={error} />
-        </section>
-        <section className="panel">
-          <h2>قراءة الفواتير</h2>
-          <p className="muted">
-            ربط مزوّد قراءة الفواتير غير مفعّل. يمكن تسجيل البضاعة من شاشة طلبات
-            البضاعة ومراجعة الكميات قبل الاستلام.
-          </p>
-          <span className="badge neutral">
-            <FileText size={15} />
-            يحتاج إعداد مزوّد OCR
-          </span>
-        </section>
-        <section className="panel">
-          <h2>WhatsApp Business</h2>
-          <p className="muted">
-            واجهة الربط الرسمية جاهزة في الكود. إرسال الرسائل يحتاج حساب Meta
-            Business وقوالب معتمدة ومفاتيح وصول.
-          </p>
-          <span className="badge neutral">غير متصل</span>
-        </section>
-      </div>
-    </>
   );
 }

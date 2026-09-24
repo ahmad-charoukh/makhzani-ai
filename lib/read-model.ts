@@ -1,18 +1,65 @@
-import { rows, statement, type Context } from "./server";
+import { owned, rows, statement, type Context } from "./server";
 import { reorder } from "./domain";
-export async function snapshot(c: Context, q = "", page = 1) {
-  const term = `%${q}%`;
-  const products = await rows(
-    "SELECT p.*,COALESCE((SELECT SUM(quantity) FROM batches b WHERE b.product_id=p.id),0) quantity,(SELECT id FROM images i WHERE i.product_id=p.id ORDER BY created_at LIMIT 1) image_id,COALESCE((SELECT SUM(-delta) FROM movements m WHERE m.product_id=p.id AND m.kind='out' AND m.created_at>=datetime('now','-30 days')),0) out30,s.name supplier_name FROM products p LEFT JOIN suppliers s ON s.id=p.supplier_id WHERE p.business_id=? AND p.active=1 AND (p.name LIKE ? OR p.barcode LIKE ? OR p.sku LIKE ? OR p.category LIKE ? OR p.brand LIKE ? OR s.name LIKE ?) ORDER BY p.name LIMIT 30 OFFSET ?",
+type InventoryQuery = {
+  category?: string;
+  stock?: string;
+  warehouse?: string;
+  sort?: string;
+};
+const inventoryOrder: Record<string, string> = {
+  "name-asc": "name COLLATE NOCASE ASC,id ASC",
+  "name-desc": "name COLLATE NOCASE DESC,id ASC",
+  "quantity-asc": "quantity ASC,name COLLATE NOCASE ASC,id ASC",
+  "quantity-desc": "quantity DESC,name COLLATE NOCASE ASC,id ASC",
+  "price-asc": "selling_price ASC,name COLLATE NOCASE ASC,id ASC",
+  "price-desc": "selling_price DESC,name COLLATE NOCASE ASC,id ASC",
+};
+export async function snapshot(
+  c: Context,
+  q = "",
+  page = 1,
+  filters: InventoryQuery = {},
+) {
+  if (filters.warehouse) await owned("warehouses", filters.warehouse, c);
+  const term = `%${q.trim().replace(/[\\%_]/g, "\\$&")}%`;
+  const warehouseClause = filters.warehouse ? " AND b.warehouse_id=?" : "";
+  const productQuery = `SELECT p.*,COALESCE((SELECT SUM(b.quantity) FROM batches b WHERE b.product_id=p.id AND b.business_id=p.business_id${warehouseClause}),0) quantity,s.name supplier_name FROM products p LEFT JOIN suppliers s ON s.id=p.supplier_id AND s.business_id=p.business_id WHERE p.business_id=? AND p.active=1 AND (p.name LIKE ? ESCAPE '\\' OR p.barcode LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.category LIKE ? ESCAPE '\\' OR p.brand LIKE ? ESCAPE '\\' OR s.name LIKE ? ESCAPE '\\')${filters.category ? " AND p.category=?" : ""}`;
+  const args: unknown[] = [
+    ...(filters.warehouse ? [filters.warehouse] : []),
     c.business,
-    term,
-    term,
-    term,
-    term,
-    term,
-    term,
+    ...Array(6).fill(term),
+    ...(filters.category ? [filters.category] : []),
+  ];
+  const stockClause =
+    filters.stock === "empty"
+      ? "quantity=0"
+      : filters.stock === "low"
+        ? "quantity>0 AND quantity<=minimum"
+        : filters.stock === "available"
+          ? "quantity>minimum"
+          : "1=1";
+  const filteredQuery = `FROM (${productQuery}) inventory WHERE ${stockClause}`;
+  const count = await statement(
+    `SELECT COUNT(*) total ${filteredQuery}`,
+    ...args,
+  ).first<{ total: number }>();
+  const totalProducts = Number(count?.total || 0);
+  const pageCount = Math.max(1, Math.ceil(totalProducts / 30));
+  page = Math.min(pageCount, Math.max(1, Math.floor(Number(page) || 1)));
+  const order = Object.prototype.hasOwnProperty.call(
+    inventoryOrder,
+    filters.sort || "",
+  )
+    ? inventoryOrder[filters.sort!]
+    : inventoryOrder["name-asc"];
+  const matches = await rows(
+    `SELECT inventory.*,(SELECT id FROM images i WHERE i.product_id=inventory.id AND i.business_id=inventory.business_id ORDER BY created_at LIMIT 1) image_id,COALESCE((SELECT SUM(-m.delta) FROM movements m WHERE m.product_id=inventory.id AND m.business_id=inventory.business_id AND m.kind='out' AND m.created_at>=datetime('now','-30 days')${filters.warehouse ? " AND m.warehouse_id=?" : ""}),0) out30 ${filteredQuery} ORDER BY ${order} LIMIT 31 OFFSET ?`,
+    ...(filters.warehouse ? [filters.warehouse] : []),
+    ...args,
     (page - 1) * 30,
   );
+  const hasMore = matches.length > 30;
+  const products = matches.slice(0, 30);
   for (const p of products) {
     p.reorder = reorder(Number(p.quantity), Number(p.out30), Number(p.minimum));
     if (c.role === "employee") {
@@ -25,7 +72,7 @@ export async function snapshot(c: Context, q = "", page = 1) {
     c.business,
   ).first<Record<string, number>>();
   if (stats && c.role === "employee") delete stats.value;
-  const [warehouses, movements, low, expiry, daily, business] =
+  const [warehouses, movements, low, expiry, daily, business, categories] =
     await Promise.all([
       rows(
         "SELECT * FROM warehouses WHERE business_id=? ORDER BY name",
@@ -48,6 +95,10 @@ export async function snapshot(c: Context, q = "", page = 1) {
         c.business,
       ),
       statement("SELECT name FROM businesses WHERE id=?", c.business).first(),
+      rows<{ category: string }>(
+        "SELECT DISTINCT category FROM products WHERE business_id=? AND active=1 AND category!='' ORDER BY category COLLATE NOCASE",
+        c.business,
+      ),
     ]);
   return {
     products,
@@ -61,6 +112,9 @@ export async function snapshot(c: Context, q = "", page = 1) {
     role: c.role,
     email: c.email,
     page,
-    hasMore: products.length === 30,
+    hasMore,
+    totalProducts,
+    pageCount,
+    categories: categories.map((p) => p.category),
   };
 }

@@ -330,4 +330,138 @@ test("API complete warehouse workflow", async (t) => {
       400,
     );
   });
+  await t.test(
+    "inventory filters and sorting apply before pagination",
+    async () => {
+      const business = sql
+        .prepare("SELECT business_id FROM members WHERE email=?")
+        .get(owner).business_id;
+      const insert = sql.prepare(
+        "INSERT INTO products(id,business_id,name,barcode,sku,category,minimum,purchase_price,selling_price) VALUES(?,?,?,?,?,?,?,?,?)",
+      );
+      const fixtureIds = [];
+      for (let i = 1; i <= 61; i++) {
+        const productId = id();
+        fixtureIds.push(productId);
+        insert.run(
+          productId,
+          business,
+          "UX Fixture " +
+            String(i).padStart(3, "0") +
+            (i === 61 ? " 100%" : ""),
+          "UX-" + i,
+          "UX-SKU-" + i,
+          i === 61 ? "Other fixture" : "Inventory fixture",
+          5000,
+          100,
+          i * 100,
+        );
+      }
+      const query = (params) =>
+        call(undefined, "inventory&" + new URLSearchParams(params));
+      const filter = { q: "UX Fixture", category: "Inventory fixture" };
+      const first = await query(filter);
+      assert.equal(first.status, 200);
+      assert.equal(first.data.products.length, 30);
+      assert.equal(first.data.totalProducts, 60);
+      assert.equal(first.data.hasMore, true);
+      assert.equal(first.data.pageCount, 2);
+      assert.ok(first.data.categories.includes("Other fixture"));
+      const last = (await query({ ...filter, page: "2" })).data;
+      assert.equal(last.products.length, 30);
+      assert.equal(
+        last.hasMore,
+        false,
+        "exactly 30 remaining products is the last page",
+      );
+      const beyond = (await query({ ...filter, page: "9999" })).data;
+      assert.equal(beyond.page, 2);
+      assert.equal((await query({ ...filter, page: "1.9" })).data.page, 1);
+      const reverse = (await query({ ...filter, sort: "price-desc" })).data;
+      assert.equal(reverse.products[0].id, fixtureIds[59]);
+      assert.equal(reverse.products.at(-1).id, fixtureIds[30]);
+      const missing = (
+        await query({ q: "no-matching-inventory-fixture", page: "6" })
+      ).data;
+      assert.equal(missing.totalProducts, 0);
+      assert.equal(missing.page, 1);
+      assert.equal(missing.hasMore, false);
+      assert.equal(
+        (await query({ q: "%" })).data.products[0].id,
+        fixtureIds[60],
+      );
+      assert.equal(
+        (await query({ q: "_" })).data.totalProducts,
+        0,
+        "search treats SQL wildcard characters literally",
+      );
+      const safeSort = await query({
+        ...filter,
+        sort: "selling_price; DROP TABLE products",
+      });
+      assert.equal(safeSort.status, 200);
+      assert.equal(safeSort.data.products[0].id, fixtureIds[0]);
+      assert.equal((await query({ ...filter, sort: "toString" })).status, 200);
+
+      const secondWarehouse = (
+        await call({
+          type: "warehouses",
+          name: "Secondary fixture",
+          branch: "Test branch",
+        })
+      ).data.id;
+      for (const [productId, warehouseId, quantity] of [
+        [fixtureIds[59], warehouse, 9],
+        [fixtureIds[59], secondWarehouse, 2],
+        [fixtureIds[58], warehouse, 3],
+      ]) {
+        assert.equal(
+          (
+            await call({
+              type: "stock",
+              id: id(),
+              kind: "in",
+              productId,
+              warehouseId,
+              quantity,
+            })
+          ).status,
+          200,
+        );
+      }
+      const available = (
+        await query({ ...filter, stock: "available", sort: "quantity-desc" })
+      ).data;
+      assert.equal(available.totalProducts, 1);
+      assert.equal(available.products[0].quantity, 11000);
+      const low = (await query({ ...filter, stock: "low" })).data;
+      assert.equal(low.totalProducts, 1);
+      assert.equal(low.products[0].id, fixtureIds[58]);
+      assert.equal(
+        (await query({ ...filter, stock: "empty" })).data.totalProducts,
+        58,
+      );
+      const warehouseLow = (
+        await query({ ...filter, warehouse: secondWarehouse, stock: "low" })
+      ).data;
+      assert.equal(warehouseLow.totalProducts, 1);
+      assert.equal(warehouseLow.products[0].id, fixtureIds[59]);
+      assert.equal(warehouseLow.products[0].quantity, 2000);
+      assert.equal(
+        (await query({ ...filter, warehouse: secondWarehouse, stock: "empty" }))
+          .data.totalProducts,
+        59,
+      );
+      const foreignWarehouse = sql
+        .prepare("SELECT id FROM warehouses WHERE business_id!=?")
+        .get(business).id;
+      assert.equal((await query({ warehouse: foreignWarehouse })).status, 404);
+      who = "employee@example.test";
+      const employee = (await query({ ...filter, stock: "available" })).data;
+      assert.equal(employee.products[0].purchase_price, undefined);
+      who = "other@example.test";
+      assert.equal((await query(filter)).data.totalProducts, 0);
+      who = owner;
+    },
+  );
 });
