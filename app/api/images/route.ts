@@ -11,11 +11,7 @@
   statement,
   uid,
 } from "@/lib/server";
-import {
-  deleteImage,
-  putImage,
-  storagePath,
-} from "@/lib/supabase-storage";
+import { deleteImage, putImage, storagePath } from "@/lib/supabase-storage";
 
 export async function POST(r: Request) {
   try {
@@ -42,8 +38,7 @@ export async function POST(r: Request) {
       productId,
     );
 
-    if (files.length >= 8)
-      throw new ApiError(400, "الحد الأقصى 8 صور");
+    if (files.length >= 8) throw new ApiError(400, "الحد الأقصى 8 صور");
 
     const file = f.get("file");
 
@@ -52,10 +47,7 @@ export async function POST(r: Request) {
 
     const bytes = new Uint8Array(await file.arrayBuffer());
 
-    const jpeg =
-      bytes[0] === 255 &&
-      bytes[1] === 216 &&
-      bytes[2] === 255;
+    const jpeg = bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
 
     const png = [137, 80, 78, 71, 13, 10, 26, 10].every(
       (v, i) => bytes[i] === v,
@@ -74,10 +66,7 @@ export async function POST(r: Request) {
           : null;
 
     if (!mime || file.type !== mime)
-      throw new ApiError(
-        400,
-        "الصورة يجب أن تكون JPEG أو PNG أو WebP",
-      );
+      throw new ApiError(400, "الصورة يجب أن تكون JPEG أو PNG أو WebP");
 
     const id = uid();
     const path = storagePath(c.business, id);
@@ -87,20 +76,15 @@ export async function POST(r: Request) {
     try {
       await db().batch([
         statement(
-          "INSERT INTO images(id,business_id,product_id,mime,size) VALUES(?,?,?,?,?)",
+          "INSERT INTO images(id,business_id,product_id,mime,size) VALUES(CASE WHEN (SELECT COUNT(*) FROM images WHERE product_id=?)<8 THEN ? ELSE NULL END,?,?,?,?)",
+          productId,
           id,
           c.business,
           productId,
           mime,
           file.size,
         ),
-        audit(
-          c,
-          "image.upload",
-          productId,
-          null,
-          { id, size: file.size },
-        ),
+        audit(c, "image.upload", productId, null, { id, size: file.size }),
       ]);
     } catch (e) {
       try {
@@ -109,6 +93,11 @@ export async function POST(r: Request) {
         console.error("Supabase image cleanup failed", cleanupError);
       }
 
+      if (
+        e instanceof Error &&
+        /NOT NULL constraint failed: images.id/.test(e.message)
+      )
+        throw new ApiError(409, "الحد الأقصى 8 صور؛ حدّث الصور وحاول مجددًا");
       throw e;
     }
 

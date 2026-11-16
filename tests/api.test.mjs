@@ -34,14 +34,28 @@ class Prepared {
     return sql.prepare(this.query).run(...this.args);
   }
 }
+const objects = new Map();
+let beforePut = async () => {};
 globalThis.__makhzaniTest = {
+  BUCKET: {
+    put: async (key, bytes) => {
+      await beforePut();
+      objects.set(key, bytes);
+    },
+    get: async (key) => (objects.has(key) ? { body: objects.get(key) } : null),
+    delete: async (key) => {
+      objects.delete(key);
+    },
+  },
   DB: {
     prepare: (q) => new Prepared(q),
     batch: async (queries) => {
       sql.exec("BEGIN");
       try {
         const result = [];
-        for (const q of queries) result.push(await q.run());
+        // D1 batches serialize their entire transaction; do not yield between statements.
+        for (const q of queries)
+          result.push(sql.prepare(q.query).run(...q.args));
         sql.exec("COMMIT");
         return result;
       } catch (e) {
@@ -54,7 +68,12 @@ globalThis.__makhzaniTest = {
 };
 mkdirSync(".sites-runtime/tests", { recursive: true });
 await build({
-  entryPoints: ["app/api/inventory/route.ts"],
+  stdin: {
+    contents:
+      'export {GET,POST} from "./app/api/inventory/route"; export {GET as exportCSV} from "./app/api/export/route"; export {stockStatements} from "./lib/stock"; export {context} from "./lib/server"; export {POST as uploadImage} from "./app/api/images/route"; export {GET as readImage} from "./app/api/images/[id]/route";',
+    resolveDir: process.cwd(),
+    loader: "ts",
+  },
   outfile: ".sites-runtime/tests/api.mjs",
   bundle: true,
   platform: "node",
@@ -64,6 +83,18 @@ await build({
     {
       name: "test-boundaries",
       setup(b) {
+        b.onResolve({ filter: /^@\/lib\/supabase-storage$/ }, () => ({
+          path: "storage",
+          namespace: "test-storage",
+        }));
+        b.onLoad({ filter: /.*/, namespace: "test-storage" }, () => ({
+          contents: `const storage=globalThis.__makhzaniTest.BUCKET;
+            export const storagePath=(business,id)=>business+"/"+id;
+            export const putImage=(path,bytes)=>storage.put(path,bytes);
+            export const deleteImage=path=>storage.delete(path);
+            export const getImage=async path=>{const value=await storage.get(path);return value?new Blob([value.body]):null;};`,
+          loader: "js",
+        }));
         b.onResolve(
           { filter: /^cloudflare:workers$|^next\/headers$|^next\/navigation$/ },
           (args) => ({ path: args.path, namespace: "mock" }),
@@ -261,7 +292,13 @@ test("API complete warehouse workflow", async (t) => {
       const r = await call();
       assert.equal(r.data.products[0].purchase_price, undefined);
       assert.equal(r.data.stats.value, undefined);
-      for (const view of ["suppliers", "members", "purchases", "audit"])
+      for (const view of [
+        "suppliers",
+        "members",
+        "purchases",
+        "audit",
+        "reports",
+      ])
         assert.equal((await call(undefined, view)).status, 403);
       assert.equal(
         (await call({ type: "product", name: "Wrong", barcode: "z", sku: "z" }))
@@ -283,6 +320,83 @@ test("API complete warehouse workflow", async (t) => {
       ),
     );
   });
+  await t.test(
+    "report dates, summary and CSV use the same inclusive period",
+    async () => {
+      const today = new Date().toISOString().slice(0, 10);
+      const r = await call(undefined, `reports&from=${today}&to=${today}`);
+      assert.equal(r.status, 200);
+      assert.equal(r.data.summary.incoming, 30000);
+      assert.equal(r.data.summary.outgoing, 25000);
+      assert.equal(r.data.summary.counts, 1);
+      assert.equal(r.data.suppliers[0].received_value, 90);
+      const empty = await call(
+        undefined,
+        "reports&from=2000-01-01&to=2000-01-01",
+      );
+      assert.equal(empty.data.summary.incoming, 0);
+      assert.equal(empty.data.movements.length, 0);
+      for (const query of [
+        "from=2026-02-30",
+        "from=2026-03-02&to=2026-03-01",
+        "from=2020-01-01&to=2026-01-01",
+      ])
+        assert.equal((await call(undefined, "reports&" + query)).status, 400);
+      const csv = await route.exportCSV(
+        new Request(
+          `https://test.local/api/export?kind=movements&from=${today}&to=${today}`,
+        ),
+      );
+      assert.equal(csv.status, 200);
+      assert.match(await csv.text(), /مياه/);
+      const old = await route.exportCSV(
+        new Request(
+          "https://test.local/api/export?kind=movements&from=2000-01-01&to=2000-01-01",
+        ),
+      );
+      assert.doesNotMatch(await old.text(), /مياه/);
+    },
+  );
+  await t.test(
+    "stock audits read committed totals when operations were planned concurrently",
+    async () => {
+      const c = await route.context();
+      const input = {
+        productId: product,
+        warehouseId: warehouse,
+        kind: "in",
+        quantity: 2,
+        reason: "",
+        invoice: "",
+      };
+      const a = { ...input, id: id() },
+        b = { ...input, id: id() };
+      // Both plans observe three units; the second commits after the first.
+      const first = await route.stockStatements(c, a);
+      const second = await route.stockStatements(c, b);
+      for (const [op, queries] of [
+        [a, first],
+        [b, second],
+      ]) {
+        await globalThis.__makhzaniTest.DB.batch([
+          new Prepared(
+            "INSERT INTO operations(id,business_id,actor,kind,reason,fingerprint) VALUES(?,?,?,?,?,?)",
+            [op.id, c.business, c.actor, op.kind, "", JSON.stringify(op)],
+          ),
+          ...queries,
+        ]);
+      }
+      const audits = sql
+        .prepare(
+          "SELECT before,after FROM audit_logs WHERE entity=? AND action='in' ORDER BY rowid DESC LIMIT 2",
+        )
+        .all(product);
+      assert.equal(JSON.parse(audits[0].before).quantity, 5);
+      assert.equal(JSON.parse(audits[0].after).quantity, 7);
+      assert.equal(JSON.parse(audits[1].before).quantity, 3);
+      assert.equal(JSON.parse(audits[1].after).quantity, 5);
+    },
+  );
   await t.test("foreign business cannot read or mutate product", async () => {
     who = "other@example.test";
     await call({ type: "setup", name: "Other" });
@@ -302,6 +416,85 @@ test("API complete warehouse workflow", async (t) => {
     );
     who = owner;
   });
+  await t.test("purchase prices reject excess precision", async () => {
+    assert.equal(
+      (
+        await call({
+          type: "purchase",
+          action: "create",
+          supplierId: supplier,
+          items: [{ productId: product, quantity: 1, price: 1.123 }],
+        })
+      ).status,
+      400,
+    );
+  });
+  await t.test(
+    "private uploads validate MIME and enforce eight images even with concurrent uploads",
+    async () => {
+      await call(); // restore the owner's trusted request identity
+      const png = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+        "base64",
+      );
+      async function upload(bytes = png, mime = "image/png") {
+        const f = new FormData();
+        f.set("productId", product);
+        f.set("file", new File([bytes], "photo.png", { type: mime }));
+        return route.uploadImage(
+          new Request("https://test.local/api/images", {
+            method: "POST",
+            headers: { origin: "https://test.local" },
+            body: f,
+          }),
+        );
+      }
+      assert.equal((await upload(Buffer.from("<svg></svg>"))).status, 400);
+      assert.equal((await upload(png, "image/jpeg")).status, 400);
+      let imageId;
+      for (let i = 0; i < 7; i++) {
+        const response = await upload();
+        assert.equal(response.status, 200);
+        imageId = (await response.json()).id;
+      }
+      const found = await route.readImage(
+        new Request("https://test.local/api/images/" + imageId),
+        { params: Promise.resolve({ id: imageId }) },
+      );
+      assert.equal(found.status, 200);
+      assert.equal(found.headers.get("content-type"), "image/png");
+      assert.deepEqual(Buffer.from(await found.arrayBuffer()), png);
+      let waiting = 0,
+        release;
+      const barrier = new Promise((r) => {
+        release = r;
+      });
+      beforePut = async () => {
+        if (++waiting === 2) release();
+        await barrier;
+      };
+      const result = await Promise.all([upload(), upload()]);
+      beforePut = async () => {};
+      assert.deepEqual(result.map((r) => r.status).sort(), [200, 409]);
+      assert.equal(objects.size, 8);
+      who = "employee@example.test";
+      await call();
+      assert.equal((await upload()).status, 403);
+      who = "other@example.test";
+      await call();
+      assert.equal(
+        (
+          await route.readImage(
+            new Request("https://test.local/api/images/" + imageId),
+            { params: Promise.resolve({ id: imageId }) },
+          )
+        ).status,
+        404,
+      );
+      who = owner;
+      await call();
+    },
+  );
   await t.test("CSRF origin rejected", async () => {
     const r = await route.POST(
       new Request("https://test.local/api/inventory", {

@@ -74,7 +74,7 @@ export type Snapshot = {
   expiry: Batch[];
   daily: { day: string; incoming: number; outgoing: number; count: number }[];
   movements: Movement[];
-  business: { name: string };
+  business: { id: string; name: string };
   role: "owner" | "manager" | "employee";
   email: string;
   page: number;
@@ -82,6 +82,11 @@ export type Snapshot = {
   categories?: string[];
   totalProducts?: number;
   pageCount?: number;
+  insights?: {
+    expiry: { expired: number; soon: number };
+    pendingPurchases: {id: string; status: string; created_at: string; supplier: string; total: number}[];
+    topMoving: {id: string; name: string; unit: string; quantity: number; operations: number}[];
+  };
 };
 export const kindLabels: Record<string, string> = {
   in: "إدخال بضاعة",
@@ -184,4 +189,15 @@ export async function api(data: unknown) {
 export async function get(view: string, signal?: AbortSignal) {
   const r = await request("/api/inventory?view=" + view, { signal });
   return readApiResponse<ReadResult>(r, "تعذر التحميل");
+}
+
+export function clearSessionCache() {
+  try {
+    for (const key of Object.keys(sessionStorage)) {
+      if (key === "mk-cache" || key.startsWith("mk-detail:"))
+        sessionStorage.removeItem(key);
+    }
+  } catch {
+    /* Signing out must work even when browser storage is unavailable. */
+  }
 }

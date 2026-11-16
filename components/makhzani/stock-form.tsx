@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ScanLine, CheckCircle2, LoaderCircle } from "lucide-react";
 import {
   api,
@@ -56,10 +56,39 @@ export default function StockForm({
   const [detailVersion, setDetailVersion] = useState(0);
   const searchRequest = useRef(0);
   const [opId] = useState(() => crypto.randomUUID());
+  const loadDetail = useCallback(
+    async (id: string) => {
+      const key = `mk-detail:${data.email}:${data.business.id}:${id}`;
+      if (!navigator.onLine) {
+        const cached = sessionStorage.getItem(key);
+        if (!cached)
+          throw Error(
+            "افتح هذا المنتج أثناء الاتصال أولًا لحفظ كمياته على الجهاز",
+          );
+        const detail = JSON.parse(cached) as Awaited<ReturnType<typeof get>>;
+        if (
+          !detail.product ||
+          detail.product.id !== id ||
+          !Array.isArray(detail.batches)
+        )
+          throw Error("تعذر قراءة بيانات المنتج المحفوظة");
+        return detail;
+      }
+      const detail = await get("detail&id=" + encodeURIComponent(id));
+      if (!detail.product) throw Error("تعذر تحميل بيانات المنتج");
+      try {
+        sessionStorage.setItem(key, JSON.stringify(detail));
+      } catch {
+        /* Online work does not require a writable cache. */
+      }
+      return detail;
+    },
+    [data.email, data.business.id],
+  );
   useEffect(() => {
     let active = true;
     if (product?.id)
-      void get("detail&id=" + encodeURIComponent(product.id))
+      void loadDetail(product.id)
         .then((d) => {
           if (!active) return;
           setBatches(d.batches);
@@ -85,7 +114,7 @@ export default function StockForm({
     return () => {
       active = false;
     };
-  }, [product?.id, detailVersion]);
+  }, [product?.id, detailVersion, loadDetail]);
   function select(p: Product) {
     searchRequest.current += 1;
     setSearching(false);
@@ -105,7 +134,15 @@ export default function StockForm({
     setSearching(true);
     setError("");
     try {
-      const d = await get("dashboard&q=" + encodeURIComponent(code));
+      const d = navigator.onLine
+        ? await get("dashboard&q=" + encodeURIComponent(code))
+        : {
+            products: data.products.filter((p) =>
+              [p.name, p.barcode, p.sku, p.id].some((v) =>
+                v.toLowerCase().includes(code.toLowerCase()),
+              ),
+            ),
+          };
       if (request !== searchRequest.current) return;
       setResults(d.products);
       const exact = d.products.find(
@@ -167,14 +204,25 @@ export default function StockForm({
         try {
           const drafts = JSON.parse(localStorage.getItem("mk-drafts") || "[]");
           if (!Array.isArray(drafts)) throw Error();
-          drafts.push({
-            ...body,
-            email: data.email,
-            productName: product.name,
-            unit: product.unit,
-            warehouseName: data.warehouses.find((item) => item.id === warehouse)
-              ?.name,
-          });
+          if (
+            !drafts.some(
+              (d) =>
+                d?.id === opId &&
+                d?.email === data.email &&
+                d?.businessId === data.business.id,
+            )
+          )
+            drafts.push({
+              ...body,
+              email: data.email,
+              businessId: data.business.id,
+              createdAt: new Date().toISOString(),
+              productName: product.name,
+              unit: product.unit,
+              warehouseName: data.warehouses.find(
+                (item) => item.id === warehouse,
+              )?.name,
+            });
           localStorage.setItem("mk-drafts", JSON.stringify(drafts));
         } catch {
           throw Error(
@@ -329,7 +377,11 @@ export default function StockForm({
                   </Field>
                 </div>
                 <div className="quantity-preview">
-                  <span>الموجود بالنظام</span>
+                  <span>
+                    {navigator.onLine
+                      ? "الموجود بالنظام"
+                      : "آخر كمية محفوظة على الجهاز"}
+                  </span>
                   <strong>
                     {number(current)} {product.unit}
                   </strong>
@@ -388,13 +440,22 @@ export default function StockForm({
                 )}
                 {kind === "out" &&
                   batches.filter(
-                    (b) => b.warehouse_id === warehouse && b.quantity > 0,
+                    (b) =>
+                      b.warehouse_id === warehouse &&
+                      b.quantity > 0 &&
+                      (!b.expires ||
+                        b.expires >= new Date().toISOString().slice(0, 10)),
                   )[0]?.expires && (
                     <div className="info-box">
                       استخدم هذه الدفعة أولًا:{" "}
                       {
                         batches.filter(
-                          (b) => b.warehouse_id === warehouse && b.quantity > 0,
+                          (b) =>
+                            b.warehouse_id === warehouse &&
+                            b.quantity > 0 &&
+                            (!b.expires ||
+                              b.expires >=
+                                new Date().toISOString().slice(0, 10)),
                         )[0].lot
                       }
                     </div>

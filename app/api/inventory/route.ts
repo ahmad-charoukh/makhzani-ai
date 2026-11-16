@@ -14,6 +14,7 @@ import {
   statement,
   uid,
 } from "@/lib/server";
+import { dateRange, report, reportFilters } from "@/lib/reports";
 import { snapshot } from "@/lib/read-model";
 import { executeStock, stockInput } from "@/lib/stock";
 import { purchaseAction } from "@/lib/purchases";
@@ -25,12 +26,35 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const view = url.searchParams.get("view") || "dashboard";
     const c = await context(
-      ["suppliers", "purchases", "audit", "members", "settings"].includes(view)
+      [
+        "suppliers",
+        "purchases",
+        "audit",
+        "members",
+        "settings",
+        "reports",
+      ].includes(view)
         ? view === "audit"
           ? "reports"
           : view
         : "read",
     );
+    if (view === "reports")
+      return Response.json(
+        await report(
+          c,
+          dateRange(url.searchParams.get("from"), url.searchParams.get("to")),
+          Math.max(
+            1,
+            Math.min(
+              10000,
+              Math.floor(Number(url.searchParams.get("page")) || 1),
+            ),
+          ),
+          reportFilters(url.searchParams),
+        ),
+        { headers: { "Cache-Control": "private, no-store" } },
+      );
     if (view === "detail") {
       const p = await owned("products", url.searchParams.get("id") || "", c);
       if (c.role === "employee") delete p.purchase_price;

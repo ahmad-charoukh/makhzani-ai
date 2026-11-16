@@ -1,3 +1,4 @@
+import { dateRange, movementReportScope, productReportScope, reportFilters, validateReportFilters } from "@/lib/reports";
 import { context, errorResponse, rows } from "@/lib/server";
 function csv(value: unknown) {
   let s = String(value ?? "");
@@ -7,7 +8,15 @@ function csv(value: unknown) {
 export async function GET(r: Request) {
   try {
     const c = await context("reports");
-    const movements = new URL(r.url).searchParams.get("kind") === "movements";
+    const params = new URL(r.url).searchParams;
+    const movements = params.get("kind") === "movements";
+    const range = movements
+      ? dateRange(params.get("from"), params.get("to"))
+      : null;
+    const filters = reportFilters(params);
+    await validateReportFilters(c, filters);
+    const movement = range ? movementReportScope(c, range, filters) : null;
+    const product = productReportScope(filters);
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
@@ -16,7 +25,7 @@ export async function GET(r: Request) {
             encoder.encode(
               "\uFEFF" +
                 (movements
-                  ? ["المنتج", "الحركة", "الكمية", "المخزن", "السبب", "التاريخ"]
+                  ? ["المنتج", "الحركة", "الكمية", "الوحدة", "المخزن", "المستخدم", "السبب", "التاريخ"]
                   : [
                       "المنتج",
                       "الباركود",
@@ -37,13 +46,15 @@ export async function GET(r: Request) {
           for (;;) {
             const list = movements
               ? await rows(
-                  "SELECT m.rowid cursor,m.*,p.name,w.name warehouse FROM movements m JOIN products p ON p.id=m.product_id JOIN warehouses w ON w.id=m.warehouse_id WHERE m.business_id=? AND m.rowid>? ORDER BY m.rowid LIMIT 500",
-                  c.business,
+                  `SELECT m.rowid cursor,m.*,p.name,p.unit,w.name warehouse FROM movements m JOIN products p ON p.id=m.product_id AND p.business_id=m.business_id JOIN warehouses w ON w.id=m.warehouse_id AND w.business_id=m.business_id WHERE ${movement!.clause} AND m.rowid>? ORDER BY m.rowid LIMIT 500`,
+                  ...movement!.args,
                   cursor,
                 )
               : await rows(
-                  "SELECT p.rowid cursor,p.*,COALESCE((SELECT SUM(quantity) FROM batches b WHERE b.product_id=p.id),0) quantity FROM products p WHERE p.business_id=? AND p.active=1 AND p.rowid>? ORDER BY p.rowid LIMIT 500",
+                  `SELECT p.rowid cursor,p.*,COALESCE((SELECT SUM(quantity) FROM batches b WHERE b.product_id=p.id AND b.business_id=p.business_id${filters.warehouse ? " AND b.warehouse_id=?" : ""}),0) quantity FROM products p WHERE p.business_id=? AND p.active=1${product.clause} AND p.rowid>? ORDER BY p.rowid LIMIT 500`,
+                  ...(filters.warehouse ? [filters.warehouse] : []),
                   c.business,
+                  ...product.args,
                   cursor,
                 );
             if (!list.length) break;
@@ -53,7 +64,9 @@ export async function GET(r: Request) {
                     x.name,
                     x.kind,
                     Number(x.delta) / 1000,
+                    x.unit,
                     x.warehouse,
+                    x.actor,
                     x.reason,
                     x.created_at,
                   ]

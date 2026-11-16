@@ -39,9 +39,9 @@ CSV exports paginate through the full dataset and neutralize spreadsheet formula
 - This is a working implementation under verification, **not a completed production certification** of the entire master specification.
 - Primary UI is Arabic RTL. English/Turkish currently change direction, speech language and welcome copy; full translation remains unfinished.
 - Deterministic assistant and draft confirmation work. Cloud/local LLM, invoice OCR and official WhatsApp have provider interfaces only, no configured production adapters.
-- Offline support retains an in-session stock snapshot and local movement drafts; offline cold-start inventory and background sync are not implemented. Reconnect requires explicit review. Clear device data after using a shared device.
-- Purchase API accepts multiple items; the create form supports multiple items. Product selection currently uses the loaded inventory page.
-- Reports currently cover 30-day movements, stock valuation, reorder estimates and CSV/print; custom date ranges, native XLSX and full supplier/loss analytics are pending.
+- Offline support retains an in-session stock snapshot and local movement drafts; offline cold-start inventory and background sync are not implemented. All roles can review drafts explicitly on reconnect; drafts are scoped to the account/business. Product details visited online remain available in that browser session. Clear device data after using a shared device.
+- Purchase forms support multiple items and server-side product search. Receipt retries retain their operation identifier to prevent duplicate stock.
+- Reports provide inclusive date ranges, daily/weekly/monthly presets, matching CSV exports, supplier purchase cohorts and loss estimates. Valuation uses current purchase prices; it is not historical accounting. Report dates currently use UTC. Native XLSX is pending.
 - No automatic backups/restore drill, external penetration test, production load test, hardware camera test, or full signed-in mobile/desktop browser E2E has been completed.
 - No standalone Docker/PostgreSQL deployment or S3 driver yet. Migration is possible but requires a separate adapter and PostgreSQL transaction/trigger port, not merely changing a URL.
 - Units are custom labels with thousandth precision; packaging conversion factors, per-member permission overrides and negative-stock privileges are not implemented.

@@ -26,7 +26,11 @@ export async function purchaseAction(c: Context, raw: unknown) {
           z.object({
             productId: z.string(),
             quantity: z.number().positive(),
-            price: z.number().nonnegative(),
+            price: z
+              .number()
+              .nonnegative()
+              .max(1e9)
+              .refine((n) => Math.abs(n * 100 - Math.round(n * 100)) < 1e-5),
             expires: z.string().optional(),
             lot: z.string().optional(),
           }),

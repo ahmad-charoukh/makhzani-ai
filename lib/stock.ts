@@ -2,7 +2,6 @@ import { z } from "zod";
 import { allocate, scaled } from "./domain";
 import {
   ApiError,
-  audit,
   db,
   owned,
   rows,
@@ -170,13 +169,22 @@ export async function stockStatements(
     );
   }
   statements.push(
-    audit(
-      c,
+    statement(
+      "INSERT INTO audit_logs(id,business_id,actor,action,entity,before,after,reason,ip) SELECT ?,?,?,?, ?,json_object('warehouse',?,'quantity',(COALESCE(SUM(quantity),0)-?)/1000.0),json_object('warehouse',?,'quantity',COALESCE(SUM(quantity),0)/1000.0,'operation',?),?,? FROM batches WHERE business_id=? AND product_id=? AND warehouse_id=?",
+      uid(),
+      c.business,
+      c.actor,
       x.kind,
       x.productId,
-      { warehouse: x.warehouseId, quantity: total / 1000 },
-      { quantity: (total + delta) / 1000, operation: x.id },
+      x.warehouseId,
+      delta,
+      x.warehouseId,
+      x.id,
       x.reason,
+      c.ip || "",
+      c.business,
+      x.productId,
+      x.warehouseId,
     ),
   );
   return statements;

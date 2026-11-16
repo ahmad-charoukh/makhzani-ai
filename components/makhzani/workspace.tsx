@@ -26,7 +26,6 @@ import {
   History,
   TriangleAlert,
   RefreshCw,
-  Download,
   Mic,
   Send,
   WifiOff,
@@ -43,12 +42,16 @@ import {
   get,
   number,
   kindLabels,
+  clearSessionCache,
   type Product,
   type Snapshot,
 } from "./types";
 import { Empty, ErrorBox, Field, Modal, ProductIcon } from "./primitives";
 import { Inventory } from "./inventory";
 import SettingsPanel from "./settings-panel";
+import { AnimatedNumber } from "./animated-number";
+import { NotificationCenter, OperationsInsights } from "./operations-insights";
+import CommandMenu from "./command-menu";
 const deferredLoading = () => (
   <div className="component-loading" role="status">
     <span className="loading-bar" />
@@ -79,6 +82,7 @@ const StockChart = dynamic(() => import("./stock-chart"), {
   ssr: false,
   loading: deferredLoading,
 });
+const ReportsPanel = dynamic(() => import("./reports-panel"), { ssr: false });
 const navigation = [
   ["dashboard", "نظرة عامة", LayoutDashboard],
   ["inventory", "المخزون", Boxes],
@@ -127,6 +131,17 @@ export default function Workspace() {
     { productId: string; quantity: number; kind: string } | undefined
   >();
   const [locale, setLocale] = useState("ar");
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && data && (!modal || modal === "command")) {
+        event.preventDefault();
+        setMenu(false);
+        setModal(current => current === "command" ? null : "command");
+      }
+    };
+    document.addEventListener("keydown", shortcut);
+    return () => document.removeEventListener("keydown", shortcut);
+  }, [data, modal]);
   const load = useCallback(async () => {
     requestRef.current?.abort();
     const controller = new AbortController();
@@ -143,7 +158,7 @@ export default function Workspace() {
         if (r.status === 401 || r.status === 403) {
           setData(null);
           try {
-            sessionStorage.removeItem("mk-cache");
+            clearSessionCache();
           } catch {
             /* Storage can be disabled. */
           }
@@ -335,14 +350,8 @@ export default function Workspace() {
     }
   }
   const openSearch = () => {
-    nav("inventory");
-    setTimeout(
-      () =>
-        document
-          .querySelector<HTMLInputElement>(".inventory-toolbar input")
-          ?.focus(),
-      0,
-    );
+    setMenu(false);
+    setModal("command");
   };
 
   const tr = (ar: string, en: string, tr: string) =>
@@ -495,9 +504,17 @@ export default function Workspace() {
           </div>
           <ChevronLeft size={16} />
         </div>
-        <small className="nav-label">إدارة مخزونك</small>
         <nav aria-label="القائمة الرئيسية">
-          {visibleNav.map(([key, label, Icon]) => (
+          {[
+            {label:"مساحة العمل",keys:["dashboard"]},
+            {label:"المخزون",keys:["inventory","movements","low","warehouses"]},
+            {label:"المشتريات",keys:["purchases","suppliers"]},
+            {label:"الإدارة",keys:["reports","audit","members","settings"]},
+          ].map(group=>{
+            const items=visibleNav.filter(([key])=>group.keys.includes(key));
+            return items.length ? <div className="nav-section" key={group.label}>
+            <span className="nav-section-label">{group.label}</span>
+            {items.map(([key, label, Icon]) => (
             <button
               key={key}
               className={view === key ? "active" : ""}
@@ -511,7 +528,7 @@ export default function Workspace() {
                 <em>{number(data.stats.low + data.stats.empty)}</em>
               )}
             </button>
-          ))}
+          ))}</div>:null;})}
         </nav>
         <div className="sidebar-bottom">
           <button
@@ -543,7 +560,7 @@ export default function Workspace() {
               aria-label="تسجيل الخروج"
               href="/signout-with-chatgpt?return_to=/"
               target="_top"
-              onClick={() => sessionStorage.removeItem("mk-cache")}
+              onClick={() => clearSessionCache()}
             >
               <LogOut size={17} />
             </a>
@@ -581,9 +598,9 @@ export default function Workspace() {
             <ChevronLeft size={14} />
             <b>{navigation.find((n) => n[0] === view)?.[1]}</b>
           </div>
-          <button className="topbar-search" onClick={openSearch}>
+          <button className="topbar-search" aria-label="البحث والأوامر السريعة" aria-keyshortcuts="Control+k Meta+k" onClick={openSearch}>
             <Search size={17} />
-            <span>البحث في المخزون…</span>
+            <span>بحث أو إجراء سريع…</span><kbd dir="ltr">Ctrl K</kbd>
           </button>
           <div className="topbar-actions">
             <span className="today">
@@ -605,14 +622,14 @@ export default function Workspace() {
             <button
               className="icon-button notification-button"
               aria-label="التنبيهات"
-              onClick={() => nav("low")}
+              onClick={() => setModal("notifications")}
             >
               <Bell size={20} />
-              {data.low.length + data.expiry.length > 0 && <i />}
+              {data.stats.low + data.stats.empty + data.expiry.length + (data.insights?.pendingPurchases[0]?.total || 0) > 0 && <i />}
             </button>
           </div>
         </header>
-        <main id="main-content" className="content" tabIndex={-1}>
+        <main key={view} id="main-content" className="content" tabIndex={-1}>
           {offline && (
             <div className="info-box">
               <WifiOff size={19} />
@@ -787,9 +804,9 @@ export default function Workspace() {
                   ],
                   [
                     Package,
-                    "إجمالي الكميات",
-                    data.stats.quantity / 1000,
-                    "مجموع وحدات المنتجات",
+                    isEmployee ? "إجمالي الكميات" : "قيمة المخزون",
+                    isEmployee ? data.stats.quantity / 1000 : (data.stats.value || 0),
+                    isEmployee ? "مجموع وحدات المنتجات" : "₺ · بحسب تكلفة الشراء الحالية",
                     "violet",
                   ],
                   [
@@ -806,19 +823,22 @@ export default function Workspace() {
                     "منتجات تحتاج طلب",
                     "red",
                   ],
-                ].map(([Icon, label, value, sub, color]) => {
+                ].map(([Icon, label, value, sub, color], index) => {
                   const I = Icon as typeof Boxes;
                   return (
-                    <div key={String(label)} className="stat-card">
+                    <button type="button" key={String(label)} className="stat-card stat-action" onClick={()=>{
+                      nav(index===1 && !isEmployee ? "reports" : "inventory");
+                      if(index>1)setFilters({...inventoryDefaults,stock:index===2?"low":"empty"});
+                    }}>
                       <div className="split">
                         <span>{String(label)}</span>
                         <span className={"stat-icon " + color}>
                           <I size={21} />
                         </span>
                       </div>
-                      <strong>{number(Number(value))}</strong>
+                      <strong><AnimatedNumber value={Number(value)}/></strong>
                       <small>{String(sub)}</small>
-                    </div>
+                    </button>
                   );
                 })}
               </div>
@@ -898,6 +918,7 @@ export default function Workspace() {
                   })}
                 </div>
               </section>
+              {!isEmployee && <OperationsInsights data={data} navigate={nav} search={name=>{nav("inventory");setQ(name);}}/>}
               <div className="dashboard-columns">
                 <section className="panel chart-panel">
                   <div className="panel-heading">
@@ -1144,89 +1165,7 @@ export default function Workspace() {
               </section>
             </>
           )}
-          {view === "reports" && (
-            <>
-              <div className="section-title">
-                <div>
-                  <h1>تقارير مفهومة</h1>
-                  <p className="muted">آخر 30 يوم · كميات ووضع المخزون</p>
-                </div>
-                <div className="button-row">
-                  <button className="secondary" onClick={exportCSV}>
-                    <Download size={18} />
-                    تصدير CSV
-                  </button>
-                  <button className="primary" onClick={() => window.print()}>
-                    طباعة / PDF
-                  </button>
-                </div>
-              </div>
-              <div className="stats-grid">
-                <div className="stat-card">
-                  <span>دخل خلال 30 يوم</span>
-                  <strong>
-                    {number(
-                      data.daily.reduce((n, d) => n + d.incoming, 0) / 1000,
-                    )}
-                  </strong>
-                </div>
-                <div className="stat-card">
-                  <span>خرج خلال 30 يوم</span>
-                  <strong>
-                    {number(
-                      data.daily.reduce((n, d) => n + d.outgoing, 0) / 1000,
-                    )}
-                  </strong>
-                </div>
-                <div className="stat-card">
-                  <span>قيمة المخزون التقريبية</span>
-                  <strong>{number(data.stats.value || 0)} ₺</strong>
-                </div>
-                <div className="stat-card">
-                  <span>منتجات تحتاج طلب</span>
-                  <strong>{number(data.stats.low + data.stats.empty)}</strong>
-                </div>
-              </div>
-              <section className="panel">
-                <h2>اقتراحات الطلب</h2>
-                <p className="muted">
-                  تقدير مبني على معدل الإخراج في آخر 30 يوم، لتغطية 14 يومًا.
-                </p>
-                <div className="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>المنتج</th>
-                        <th>الاستهلاك / يوم</th>
-                        <th>متوقع أن ينفد خلال</th>
-                        <th>الكمية المقترحة</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {data.products.map((p) => (
-                        <tr key={p.id}>
-                          <td>{p.name}</td>
-                          <td>{number(p.reorder.daily)}</td>
-                          <td>
-                            {p.reorder.days === null
-                              ? "بيانات غير كافية"
-                              : `${number(p.reorder.days)} يوم`}
-                          </td>
-                          <td>
-                            {number(p.reorder.suggested)} {p.unit}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-              <section className="panel">
-                <h2>حركة المخزون</h2>
-                <MovementTable data={data} />
-              </section>
-            </>
-          )}
+          {view === "reports" && <ReportsPanel />}
           {[
             "suppliers",
             "purchases",
@@ -1293,6 +1232,8 @@ export default function Workspace() {
           {toast}
         </div>
       )}
+      {modal === "command" && <CommandMenu data={data} pages={visibleNav.map(([key,label])=>({key,label}))} close={()=>setModal(null)} navigate={target=>{setModal(null);nav(target);}} action={kind=>action(kind)} product={p=>{setSelected(p);setModal("detail");}} warehouse={id=>{setModal(null);nav("inventory");setFilters({...inventoryDefaults,warehouse:id});}}/>}
+      {modal === "notifications" && <NotificationCenter data={data} close={()=>setModal(null)} navigate={target=>{setModal(null);nav(target);}}/>}
       {modal === "product" && (
         <Modal
           title={selected ? "تعديل المنتج" : "إضافة منتج"}

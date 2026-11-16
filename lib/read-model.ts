@@ -72,7 +72,7 @@ export async function snapshot(
     c.business,
   ).first<Record<string, number>>();
   if (stats && c.role === "employee") delete stats.value;
-  const [warehouses, movements, low, expiry, daily, business, categories] =
+  const [warehouses, movements, low, expiry, daily, business, categories, expiryCounts, pendingPurchases, topMoving] =
     await Promise.all([
       rows(
         "SELECT * FROM warehouses WHERE business_id=? ORDER BY name",
@@ -94,11 +94,17 @@ export async function snapshot(
         "SELECT date(created_at) day,SUM(CASE WHEN delta>0 AND kind!='transfer' THEN delta ELSE 0 END) incoming,SUM(CASE WHEN delta<0 AND kind!='transfer' THEN -delta ELSE 0 END) outgoing,COUNT(*) count FROM movements WHERE business_id=? AND created_at>=datetime('now','-30 days') GROUP BY date(created_at) ORDER BY day",
         c.business,
       ),
-      statement("SELECT name FROM businesses WHERE id=?", c.business).first(),
+      statement(
+        "SELECT id,name FROM businesses WHERE id=?",
+        c.business,
+      ).first(),
       rows<{ category: string }>(
         "SELECT DISTINCT category FROM products WHERE business_id=? AND active=1 AND category!='' ORDER BY category COLLATE NOCASE",
         c.business,
       ),
+      statement("SELECT COALESCE(SUM(expires<date('now')),0) expired,COALESCE(SUM(expires>=date('now') AND expires<=date('now','+30 days')),0) soon FROM batches WHERE business_id=? AND quantity>0", c.business).first(),
+      c.role === "employee" ? Promise.resolve([]) : rows("SELECT o.id,o.status,o.created_at,s.name supplier,COUNT(*) OVER() total FROM purchases o JOIN suppliers s ON s.id=o.supplier_id AND s.business_id=o.business_id WHERE o.business_id=? AND o.status IN ('sent','confirmed','partial') ORDER BY o.created_at LIMIT 5", c.business),
+      c.role === "employee" ? Promise.resolve([]) : rows("SELECT p.id,p.name,p.unit,SUM(-m.delta) quantity,COUNT(DISTINCT m.operation_id) operations FROM movements m JOIN products p ON p.id=m.product_id AND p.business_id=m.business_id WHERE m.business_id=? AND m.kind='out' AND m.created_at>=datetime('now','-30 days') AND p.active=1 GROUP BY p.id ORDER BY operations DESC,quantity DESC,p.name LIMIT 5", c.business),
     ]);
   return {
     products,
@@ -116,5 +122,6 @@ export async function snapshot(
     totalProducts,
     pageCount,
     categories: categories.map((p) => p.category),
+    insights: { expiry: expiryCounts, pendingPurchases, topMoving },
   };
 }
